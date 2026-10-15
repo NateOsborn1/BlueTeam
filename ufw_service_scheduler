@@ -1,0 +1,56 @@
+#!/bin/bash
+
+# Ensure script is run as root
+if [ "$EUID" -ne 0 ]; then
+  echo "[-] Please run as root (sudo)."
+  exit 1
+fi
+
+echo "[+] Starting security state enforcement..."
+
+# 1. Manage and verify services (SSH, FTP)
+SERVICES=("ssh" "vsftpd")
+
+for svc in "${SERVICES[@]}"; do
+  if systemctl is-active --quiet "$svc"; then
+    echo "[*] Service '$svc' is already running."
+  else
+    echo "[+] Service '$svc' is not running. Starting and enabling..."
+    systemctl enable --now "$svc"
+  fi
+done
+
+# 2. Ensure UFW is active
+if ! ufw status | grep -q "Status: active"; then
+  echo "[!] UFW is disabled! Enabling..."
+  ufw --force enable
+fi
+
+# 3. Define required allowed ports
+REQUIRED_PORTS=("22/tcp" "21/tcp" "443/tcp" "445/tcp" "139/tcp")
+
+# Check and enforce each required port in UFW
+for port in "${REQUIRED_PORTS[@]}"; do
+  if ! ufw status | grep -qw "$port"; then
+    echo "[+] Rule missing for $port. Adding ALLOW rule..."
+    ufw allow "$port"
+  else
+    echo "[*] Rule for $port is already present."
+  fi
+done
+
+# 4. Ensure ICMP (ping) is explicitly allowed in UFW before.rules
+# UFW handles ICMP via /etc/ufw/before.rules under the ufw-before-input chain.
+# Let's ensure the echo-request rule exists and isn't dropped.
+UFW_BEFORE_RULES="/etc/ufw/before.rules"
+if grep -q -- "-A ufw-before-input -p icmp --icmp-type echo-request -j ACCEPT" "$UFW_BEFORE_RULES"; then
+  echo "[*] ICMP echo-request rule is already configured."
+else
+  echo "[+] Adding ICMP echo-request allow rule to $UFW_BEFORE_RULES..."
+  # Insert the rule right before the commit or under the input section safely
+  sed -i '/-A ufw-before-input -p icmp --icmp-type echo-request/d' "$UFW_BEFORE_RULES"
+  sed -i '/# Ok ICMP traffic/a -A ufw-before-input -p icmp --icmp-type echo-request -j ACCEPT' "$UFW_BEFORE_RULES"
+  ufw reload
+fi
+
+echo "[+] Hardening enforcement check completed successfully."
