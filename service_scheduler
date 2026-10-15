@@ -1,0 +1,210 @@
+#!/bin/bash
+
+# Ensure script is run as root
+if [ "$EUID" -ne 0 ]; then
+  echo "[-] Please run as root (sudo)."
+  exit 1
+fi
+
+echo "[+] Starting security state enforcement..."
+
+# ==============================================================================
+# 0. Configuration Backup & Restore (Check-First)
+# ==============================================================================
+BACKUP_DIR="/var/backups/service_state_backups"
+mkdir -p "$BACKUP_DIR"
+
+# Map config paths to the services that need a restart if restored
+declare -A CONFIG_MAP=(
+  ["/etc/ssh/sshd_config"]="ssh"
+  ["/etc/vsftpd.conf"]="vsftpd"
+  ["/etc/samba/smb.conf"]="smbd nmbd"
+  ["/etc/apache2"]="apache2"
+)
+
+# Track which services need a restart due to config restoration
+declare -A RESTART_NEEDED=()
+
+for cfg_path in "${!CONFIG_MAP[@]}"; do
+  if [ ! -e "$cfg_path" ]; then
+    continue
+  fi
+
+  # Create a safe backup name by replacing slashes with underscores
+  safe_name=$(echo "$cfg_path" | sed 's|^/||; s|/|_|g')
+  backup_target="$BACKUP_DIR/$safe_name"
+
+  # First run: create initial baseline backup if it does not exist
+  if [ ! -e "$backup_target" ]; then
+    echo "[+] Creating initial baseline backup for $cfg_path..."
+    cp -a "$cfg_path" "$backup_target"
+  else
+    # Subsequent runs: compare live config against backup
+    if ! diff -rq "$cfg_path" "$backup_target" >/dev/null 2>&1; then
+      echo "[!] Drift detected in $cfg_path! Restoring from backup..."
+      if [ -d "$cfg_path" ]; then
+        rm -rf "$cfg_path"
+        cp -a "$backup_target" "$cfg_path"
+      else
+        cp -a "$backup_target" "$cfg_path"
+      fi
+      # Flag associated service(s) for restart
+      for assoc_svc in ${CONFIG_MAP[$cfg_path]}; do
+        RESTART_NEEDED["$assoc_svc"]=1
+      done
+    fi
+  fi
+done
+
+# ==============================================================================
+# 1. Unmask, Enable, and Start Services (SSH, vsftpd, Apache2, Samba)
+# ==============================================================================
+# Note: On Debian/Ubuntu, Samba runs as 'smbd' and 'nmbd'
+SERVICES=("ssh" "vsftpd" "apache2" "smbd" "nmbd")
+
+# Also ensure the umbrella 'samba' unit isn't masked if present
+if systemctl list-unit-files "samba.service" >/dev/null 2>&1; then
+  if systemctl is-enabled "samba" 2>/dev/null | grep -q "masked"; then
+    echo "[!] Unmasking samba umbrella service..."
+    systemctl unmask "samba"
+  fi
+fi
+
+for svc in "${SERVICES[@]}"; do
+  # 1a. Unmask only if currently masked
+  svc_enable_state=$(systemctl is-enabled "$svc" 2>/dev/null)
+  if [[ "$svc_enable_state" == *"masked"* ]] || [ -L "/etc/systemd/system/${svc}.service" ] && [ "$(readlink -f "/etc/systemd/system/${svc}.service")" = "/dev/null" ]; then
+    echo "[!] Service '$svc' is masked. Unmasking..."
+    systemctl unmask "$svc"
+    svc_enable_state=$(systemctl is-enabled "$svc" 2>/dev/null)
+  fi
+
+  # 1b. Enable only if not enabled
+  if [ "$svc_enable_state" != "enabled" ]; then
+    echo "[+] Enabling service '$svc'..."
+    systemctl enable "$svc"
+  fi
+
+  # 1c. Start/Restart if inactive or if config was restored
+  if ! systemctl is-active --quiet "$svc"; then
+    echo "[+] Service '$svc' is not running. Starting..."
+    systemctl restart "$svc"
+  elif [ "${RESTART_NEEDED[$svc]}" == "1" ]; then
+    echo "[+] Config restored for '$svc'. Restarting service to apply..."
+    systemctl restart "$svc"
+  else
+    echo "[*] Service '$svc' is healthy and running."
+  fi
+done
+
+# ==============================================================================
+# 2. Ensure UFW is Active & Remove "Deny All Incoming"
+# ==============================================================================
+UFW_STATUS=$(ufw status verbose)
+
+if ! grep -q "Status: active" <<< "$UFW_STATUS"; then
+  echo "[!] UFW is disabled! Enabling..."
+  ufw --force enable
+  UFW_STATUS=$(ufw status verbose)
+fi
+
+# Remove default 'deny all incoming' policy if set
+if grep -qE "Default: (deny|reject) \(incoming\)" <<< "$UFW_STATUS"; then
+  echo "[!] Default incoming policy is set to deny/reject. Changing to allow..."
+  ufw default allow incoming
+  UFW_STATUS=$(ufw status verbose)
+fi
+
+# ==============================================================================
+# 3. Remove Specific UFW DENY/REJECT Rules & Enforce Allowed Ports
+# ==============================================================================
+# Ports for SSH (22), vsftpd (20, 21), Apache2 (80, 443), Samba (137, 138, 139, 445)
+REQUIRED_PORTS=(
+  "20/tcp"
+  "21/tcp"
+  "22/tcp"
+  "80/tcp"
+  "443/tcp"
+  "137/udp"
+  "138/udp"
+  "139/tcp"
+  "445/tcp"
+)
+
+# 3a. Check for and delete any DENY or REJECT rules affecting our ports/services or blanket denies
+if grep -qE "(DENY|REJECT)" <<< "$UFW_STATUS"; then
+  # Find rule numbers matching DENY/REJECT for our ports, service names, or 'Anywhere'
+  MATCH_PATTERN="(20/tcp|21/tcp|22/tcp|80/tcp|443/tcp|137/udp|138/udp|139/tcp|445/tcp|Apache|OpenSSH|SSH|Samba|vsftpd|Anywhere)"
+  
+  # Extract rule numbers in reverse order so deleting higher numbers doesn't shift lower numbers
+  DENY_RULE_NUMS=$(ufw status numbered | grep -E "(DENY|REJECT)" | grep -E "$MATCH_PATTERN" | sed -E 's/^\[ *([0-9]+)\].*/\1/' | sort -rn)
+  
+  for rule_num in $DENY_RULE_NUMS; do
+    echo "[!] Removing blocking UFW rule #$rule_num..."
+    ufw --force delete "$rule_num"
+  done
+  # Refresh cached status after deletions
+  UFW_STATUS=$(ufw status verbose)
+fi
+
+# 3b. Check and enforce each required port (Inbound + Whitelisted Outgoing)
+for port in "${REQUIRED_PORTS[@]}"; do
+  port_num="${port%/*}"
+  proto="${port#*/}"
+
+  # Ensure Inbound ALLOW rule exists
+  if ! grep -E "$port" <<< "$UFW_STATUS" | grep -q "ALLOW IN"; then
+    echo "[+] Inbound ALLOW rule missing for $port. Adding..."
+    ufw allow in "$port"
+  fi
+
+  # Ensure Outbound ALLOW rule exists (to destination port)
+  if ! grep -E "$port" <<< "$UFW_STATUS" | grep -q "ALLOW OUT"; then
+    echo "[+] Outbound ALLOW rule (to port) missing for $port. Adding..."
+    ufw allow out "$port"
+  fi
+
+  # Ensure Outbound ALLOW rule exists FROM the service's source port
+  if ! ufw status | grep -E "ALLOW OUT" | grep -q "$port"; then
+    ufw allow out from any port "$port_num" proto "$proto" >/dev/null
+  fi
+done
+
+# ==============================================================================
+# 4. Ensure ICMP (Inbound & Outbound) is Allowed in UFW before.rules
+# ==============================================================================
+UFW_BEFORE_RULES="/etc/ufw/before.rules"
+UFW_RELOAD_NEEDED=0
+
+# Ensure any explicit ICMP DROP rules in before.rules are removed
+if grep -qE -- "-A ufw-before-(input|output) -p icmp .* -j DROP" "$UFW_BEFORE_RULES"; then
+  echo "[!] Removing ICMP DROP rules from $UFW_BEFORE_RULES..."
+  sed -i -E '/-A ufw-before-(input|output) -p icmp .* -j DROP/d' "$UFW_BEFORE_RULES"
+  UFW_RELOAD_NEEDED=1
+fi
+
+# Ensure Inbound ICMP echo-request is accepted
+if ! grep -q -- "-A ufw-before-input -p icmp --icmp-type echo-request -j ACCEPT" "$UFW_BEFORE_RULES"; then
+  echo "[+] Adding inbound ICMP echo-request allow rule to $UFW_BEFORE_RULES..."
+  sed -i '/-A ufw-before-input -p icmp --icmp-type echo-request/d' "$UFW_BEFORE_RULES"
+  sed -i '/# ok icmp codes for INPUT/a -A ufw-before-input -p icmp --icmp-type echo-request -j ACCEPT' "$UFW_BEFORE_RULES"
+  UFW_RELOAD_NEEDED=1
+fi
+
+# Ensure Outbound ICMP echo-request and echo-reply are accepted
+for icmp_type in "echo-request" "echo-reply"; do
+  if ! grep -q -- "-A ufw-before-output -p icmp --icmp-type $icmp_type -j ACCEPT" "$UFW_BEFORE_RULES"; then
+    echo "[+] Adding outbound ICMP $icmp_type allow rule to $UFW_BEFORE_RULES..."
+    sed -i "/^COMMIT/i -A ufw-before-output -p icmp --icmp-type $icmp_type -j ACCEPT" "$UFW_BEFORE_RULES"
+    UFW_RELOAD_NEEDED=1
+  fi
+done
+
+if [ "$UFW_RELOAD_NEEDED" -eq 1 ]; then
+  echo "[+] Reloading UFW to apply before.rules changes..."
+  ufw reload
+else
+  echo "[*] ICMP rules are already configured."
+fi
+
+echo "[+] Hardening enforcement check completed successfully."
